@@ -400,6 +400,75 @@ export default class NexusAiChatImporterPlugin extends Plugin {
         }
     }
 
+    async handleEchoesFile(file: File) {
+        try {
+            const text = await file.text();
+            const { metadata, conversation } = this.parseEchoesMarkdown(text);
+            const created = metadata.created ? Date.parse(metadata.created) / 1000 : Math.floor(Date.now() / 1000);
+            const updated = metadata.updated ? Date.parse(metadata.updated) / 1000 : created;
+            const filePath = await this.generateFilePath(
+                metadata.title || file.name.replace(/\.md$/, ""),
+                created,
+                this.settings.dateFormat,
+                this.settings.archiveFolder
+            );
+
+            let content = `---\n` +
+                `nexus: ${this.manifest.id}\n` +
+                `provider: echoes\n` +
+                `aliases: "${metadata.title || file.name}"\n` +
+                (metadata.id ? `conversation_id: ${metadata.id}\n` : "") +
+                (metadata.url ? `url: ${metadata.url}\n` : "") +
+                `create_time: ${formatTimestamp(created, "date")} at ${formatTimestamp(created, "time")}\n` +
+                `update_time: ${formatTimestamp(updated, "date")} at ${formatTimestamp(updated, "time")}\n` +
+                `---\n\n`;
+
+            content += conversation;
+
+            await this.writeToFile(filePath, content);
+
+            if (metadata.id) {
+                this.conversationCatalog[metadata.id] = {
+                    conversationId: metadata.id,
+                    path: filePath,
+                    updateTime: updated,
+                    provider: "echoes",
+                };
+            }
+
+            await this.saveSettings();
+        } catch (err) {
+            this.logger.error("Error processing Echoes file", err);
+        }
+    }
+
+    private parseEchoesMarkdown(text: string): { metadata: any; conversation: string } {
+        const metaMatch = text.match(/## Overview\n([\s\S]*?)\n\n## Conversation/);
+        const metadata: Record<string, string> = {};
+        if (metaMatch) {
+            const lines = metaMatch[1].split(/\r?\n/);
+            for (const line of lines) {
+                const m = line.match(/- \*\*(.+?)\*\*:\s*(.*)/);
+                if (m) {
+                    const key = m[1].toLowerCase().replace(/\s+/g, "");
+                    metadata[key] = m[2];
+                }
+            }
+        }
+        const conversationIndex = text.indexOf("## Conversation");
+        const conversation = conversationIndex >= 0 ? text.substring(conversationIndex) : text;
+        return {
+            metadata: {
+                title: metadata.title || metadata.id || "Untitled",
+                url: metadata.url,
+                id: metadata.id,
+                created: metadata.created,
+                updated: metadata["lastupdated"] || metadata.updated,
+            },
+            conversation,
+        };
+    }
+
     async processConversations(zip: JSZip, file: File): Promise<void> {
         try {
             const chats = await this.extractChatsFromZip(zip);
@@ -1025,42 +1094,25 @@ ${this.importReport.generateReportContent()}
             this.app,
             "information",
             "Import Settings",
-            ["Importing ChatGPT conversations"],
-            "Only ChatGPT exports are supported currently",
+            ["Importing ChatGPT or Echoes conversations"],
+            undefined,
             { button1: "Continue" }
         ).then(() => {
             const input = document.createElement("input");
             input.type = "file";
-            input.accept = ".zip";
+            input.accept = ".zip,.md";
             input.multiple = true;
             input.onchange = async (e) => {
-                // Make this async
                 const files = Array.from(e.target.files || []);
                 if (files.length > 0) {
-                    // Sort files by timestamp
-                    const sortedFiles = files.sort((a, b) => {
-                        const timestampRegex =
-                            /(\d{4}-\d{2}-\d{2}-\d{2}-\d{2}-\d{2})/;
-                        const getTimestamp = (filename: string) => {
-                            const match = filename.match(timestampRegex);
-                            if (!match) {
-                                this.logger.warn(
-                                    `No timestamp found in filename: ${filename}`
-                                );
-                                return "0";
-                            }
-                            return match[1];
-                        };
-
-                        return getTimestamp(a.name).localeCompare(
-                            getTimestamp(b.name)
-                        );
-                    });
-
-                    // Process files sequentially
+                    const sortedFiles = files.sort((a, b) => a.name.localeCompare(b.name));
                     for (const file of sortedFiles) {
                         this.logger.info(`Processing file: ${file.name}`);
-                        await this.handleZipFile(file); // Wait for each file to complete
+                        if (file.name.toLowerCase().endsWith(".zip")) {
+                            await this.handleZipFile(file);
+                        } else {
+                            await this.handleEchoesFile(file);
+                        }
                         this.logger.info(`Completed processing: ${file.name}`);
                     }
                 }
